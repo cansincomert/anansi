@@ -192,17 +192,38 @@ where
         ann::copy_within_a_slice(&mut data_w.data, idx_f, idx_t, params_r.aligned_dim);
     }
     fn link(&self, visit_order: Vec<usize>, do_prune: bool) {
+        let start_total = Instant::now();
         let params_r = self.params.read();
         // TODO(infrawhispers) - WASM + Rayon on M1 macs is broken!
-        visit_order.iter().for_each(|vid| {
+        let start_parallel_loop = Instant::now();
+        //let mut total_time_for_search = time::Duration::new(0, 0);
+        //let mut total_time_for_update_graph = time::Duration::new(0, 0);
+        //let mut total_time_for_inter_insert = time::Duration::new(0, 0);
+
+
+        let mut loop_counter = 0;
+        visit_order.par_iter().for_each(|vid| {
+            //let start_total = Instant::now();
             let mut pruned_list: Vec<usize> = Vec::new();
             // let mut scratch: nn_query_scratch::InMemoryQueryScratch =
             //     nn_query_scratch::InMemoryQueryScratch::new(&params_r);
             let mut scratch: nn_query_scratch::InMemoryQueryScratch =
                 self.r_scratch.recv().unwrap();
             scratch.clear();
+            //let point_search_start = Instant::now();
             self.search_for_point_and_prune(*vid, &mut pruned_list, &params_r, &mut scratch);
+            //let point_search_end = Instant::now();
+            //let point_search_duration = point_search_end.duration_since(point_search_start);
+            //total_time_for_search += point_search_duration;
+
+            //println!("Time for search_for_point_and_prune: {:?}", point_search_end.duration_since(point_search_start));
+            // let mut scratch: nn_query_scratch::InMemoryQueryScratch =
+            //let update_graph_start = Instant::now();
             self.update_graph_nbrs(*vid, pruned_list.clone(), true);
+            //let update_graph_end = Instant::now();
+            //let update_graph_duration = update_graph_end.duration_since(update_graph_start);
+            //total_time_for_update_graph += update_graph_duration;
+            //println!("Time for update_graph_nbrs: {:?}", update_graph_end.duration_since(update_graph_start));
             // let old_segment: Vec<usize>;
             // {
             //     let mut segment = self.final_graph[*vid].write();
@@ -221,6 +242,7 @@ where
             //         self.in_graph[*nbr_vid].write().insert(*vid);
             //     });
             // }
+            //let inter_insert_start = Instant::now();
             self.inter_insert(
                 *vid,
                 &mut pruned_list,
@@ -228,13 +250,28 @@ where
                 &mut scratch,
                 &self.data.read(),
             );
+            //let inter_insert_end = Instant::now();
+            //let inter_insert_duration = inter_insert_end.duration_since(inter_insert_start);
+            //total_time_for_inter_insert += inter_insert_duration;
+            //println!("Time for inter_insert: {:?}", inter_insert_end.duration_since(inter_insert_start));
+
             self.s_scratch.send(scratch).unwrap();
+            //let end_time = Instant::now();
+            //println!("Total time for loop iteration: {:?}", end_time.duration_since(start_total));
+            //loop_counter += 1;
         });
+        //println!("loop_counter: {:?}", loop_counter);
+        //println!("searchAndPruneLoop: {:?}", start_parallel_loop.elapsed());
+        //println!("Total time for search_for_point_and_prune: {:?}", total_time_for_search);
+        //println!("Total time for update_graph_nbrs: {:?}", total_time_for_update_graph);
+        //println!("Total time for inter_insert: {:?}", total_time_for_inter_insert);
         if !do_prune {
+            println!("Total time: {:?}", start_total.elapsed());
             return;
         }
         let data = &self.data.read();
         // self.indexing_pool.install(|| {
+        //let start_second_loop = Instant::now();
         visit_order.iter().for_each(|curr_vid| {
             let should_prune: bool;
             let graph_copy: Vec<usize>;
@@ -297,7 +334,9 @@ where
                 // }
                 self.s_scratch.send(scratch).unwrap();
             }
-        })
+        });
+        //println!("conditionalPruningLoop: {:?}", start_second_loop.elapsed());
+
         // })
     }
 
@@ -978,7 +1017,7 @@ where
                 None => {}
             }
         });
-        println!("consolidate_delete time: {:?}", start.elapsed());
+        //println!("consolidate_delete time: {:?}", start.elapsed());
     }
 
     fn insert(&self, eids: &[EId], p: ann::Points<TVal>) -> anyhow::Result<()> {
@@ -1010,6 +1049,7 @@ where
         let data_processed;
         let mut preprocess_scratch: Vec<TVal>;
 
+        let start = Instant::now();
         if TMetric::uses_preprocessor() {
             let params_r = self.params.read();
             preprocess_scratch = vec![Default::default(); data.len()];
@@ -1027,10 +1067,13 @@ where
                 }
             }
             data_processed = &preprocess_scratch[0..preprocess_scratch.len()];
+            println!("preprocess time: {:?}", start.elapsed());
         } else {
             data_processed = data;
+            println!("not preprocessed time: {:?}", start.elapsed());
         }
         {
+            let start = Instant::now();
             // hold the lock and plop the data into our datastore - switching
             // to segments should allow us to not block _all_ readers during
             // this operation
@@ -1046,8 +1089,10 @@ where
                 data_w.data[idx_s_to..idx_e_to]
                     .copy_from_slice(&data_processed[idx_s_fr..idx_e_fr]);
             }
+            println!("data copy time: {:?}", start.elapsed());
         }
         {
+            let start = Instant::now();
             // insert items into the tag_to_location + location_to_tag
             let mut tl = self.tag_to_location.write();
             let mut lt = self.location_to_tag.write();
@@ -1055,10 +1100,12 @@ where
                 tl.insert(eids[idx], vids[idx]);
                 lt.insert(vids[idx], eids[idx]);
             }
+            println!("tag_to_location + location_to_tag time: {:?}", start.elapsed());
         }
         // finally run the insertion process
 
         self.link(vids, false);
+        println!("********************************\n");
         Ok(())
     }
     #[allow(dead_code)]

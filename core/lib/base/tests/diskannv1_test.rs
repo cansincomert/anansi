@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use base::ann;
 use base::ann::ANNIndex;
@@ -103,10 +104,115 @@ impl SIFT<'_> {
     }
 }
 
+struct GIST<'a> {
+    directory: &'a Path,
+    dims: usize,
+}
+
+impl GIST<'_> {
+    fn fetch_vectors(&self, filename: &str, dims: usize) -> anyhow::Result<Vec<f32>> {
+        let path = self.directory.join(filename);
+        let data_r = fs::read(path)?;
+        let data_r_slice = data_r.as_slice();
+
+        let mut num_vectors;
+        if filename == "gist_base.fvecs"{
+            num_vectors = 1_000_000; // 1M
+        }
+        else if filename == "gist_learn.fvecs" {
+            num_vectors = 50_000; // 500K
+        }
+        else{
+            num_vectors = data_r.len() / (4 + dims * 4); // 4 byte dimensionality vec + vector itself
+        }
+        let mut data_w: Vec<f32> = Vec::with_capacity(num_vectors * dims);
+        let mut rdr = Cursor::new(data_r_slice);
+        for _i in 0..num_vectors {
+            let dim = rdr.read_u32::<LittleEndian>().unwrap();
+            if dim != self.dims.try_into()? {
+                panic!("dim mismatch");
+            }
+            for _j in 0..dim {
+                data_w.push(rdr.read_f32::<LittleEndian>().unwrap());
+            }
+        }
+        Ok(data_w)
+    }
+
+    fn fetch_ground_truth(&self, filename: &str, num_closest: usize) -> anyhow::Result<Vec<u32>> {
+        let path = self.directory.join(filename);
+        let data_r = fs::read(path)?;
+        let data_r_slice = data_r.as_slice();
+        let mut rdr = Cursor::new(data_r_slice);
+
+        // we store the dimensionality of the vector here
+        // and then the components are (unsigned char|float | int)*d
+        // documentation is avail here: http://corpus-texmex.irisa.fr/
+        // let dims = 100;
+        let num_vectors = (data_r.len() as u32 / (4 + (num_closest as u32) * 4)) as usize;
+        let mut data_w: Vec<u32> = Vec::with_capacity(num_vectors * num_closest as usize);
+        for _ in 0..num_vectors {
+            let dim = rdr.read_u32::<LittleEndian>().unwrap();
+            if dim != num_closest.try_into().unwrap() {
+                panic!(
+                    "dim != num_closest: dim: {} num_closest: {}",
+                    dim, num_closest
+                );
+            }
+            for _j in 0..dim {
+                data_w.push(rdr.read_u32::<LittleEndian>().unwrap());
+            }
+        }
+        Ok(data_w)
+    }
+
+    fn fetch_ground_truth_by_id(
+        &self,
+        filename: &str,
+        k: usize,
+        num_closest: usize,
+    ) -> anyhow::Result<HashMap<base::ann::EId, Vec<base::ann::EId>>> {
+        let truth_vecs = self.fetch_ground_truth(filename, num_closest)?;
+        let mut truth_by_id: HashMap<base::ann::EId, Vec<base::ann::EId>> = HashMap::new();
+        for id in 0..truth_vecs.len() / num_closest {
+            let truth_vec = truth_vecs
+                [(id * num_closest) as usize..(id * num_closest + num_closest) as usize]
+                .to_vec();
+            let mut truth_eids: Vec<base::ann::EId> = Vec::with_capacity(k);
+            for i in 0..truth_vec.len() {
+                if i == k {
+                    break;
+                }
+                let mut eid: base::ann::EId = [0u8; 16];
+                BigEndian::write_uint(
+                    &mut eid,
+                    truth_vec[i].try_into().unwrap(),
+                    std::mem::size_of::<usize>(),
+                );
+                truth_eids.push(eid);
+            }
+            let mut ref_eid: base::ann::EId = [0u8; 16];
+            BigEndian::write_uint(
+                &mut ref_eid,
+                id.try_into().unwrap(),
+                std::mem::size_of::<usize>(),
+            );
+            // Printing the generated EIDs
+
+
+            truth_by_id.insert(ref_eid, truth_eids);
+        }
+        Ok(truth_by_id)
+    }
+}
+
+
 #[cfg(test)]
 mod test {
     use super::*;
+
     #[test]
+    // takes 1.45 minutes to run
     fn sift_small_deletes() {
         // let directory = Path::new("../../../../eval/data/siftsmall/");
         let directory = Path::new("../../data/siftsmall/");
@@ -115,10 +221,10 @@ mod test {
             directory: directory,
             dims: dims,
         };
-        const FIRST_N_TO_DELETE: usize = 2;
-        let k: usize = 10;
+        const FIRST_N_TO_DELETE: usize = 4;
+        let k: usize = 100;
         let base_vectors = loader
-            .fetch_vectors("sift_base.fvecs", 128)
+            .fetch_vectors("siftsmall_base.fvecs", 128)
             .expect("unable to fetch base vectors from disk");
         let mut eids: Vec<base::ann::EId> = vec![[0u8; 16]; base_vectors.len() / 128];
         for i in 0..base_vectors.len() / 128 {
@@ -131,11 +237,11 @@ mod test {
             eids[i] = eid;
         }
         let query_vectors = loader
-            .fetch_vectors("sift_query.fvecs", 128)
+            .fetch_vectors("siftsmall_query.fvecs", 128)
             .expect("unable to fetch the query vectors");
 
         let truth_vectors = loader
-            .fetch_ground_truth_by_id("sift_groundtruth.ivecs", k + FIRST_N_TO_DELETE, 100)
+            .fetch_ground_truth_by_id("siftsmall_groundtruth.ivecs", k + FIRST_N_TO_DELETE, 100)
             .expect("fetching the items");
         let params = ann::ANNParams::DiskANN {
             params: diskannv1::DiskANNParams {
@@ -146,7 +252,7 @@ mod test {
                 indexing_queue_size: 100, // L
                 indexing_maxc: 140,       // C
                 indexing_alpha: 1.2,      // alpha
-                maintenance_period_millis: 500,
+                maintenance_period_millis: 100, // update period in millis
             },
         };
         let ann_idx: Arc<diskannv1::DiskANNV1Index<metric::MetricL2, f32>> =
@@ -164,8 +270,9 @@ mod test {
                     }
                 )
                 .is_ok(),
-            "unexpexted err on batch_insert to the vector store"
+            "unexpected err on batch_insert to the vector store"
         );
+        let mut recall: f32 = 0.00;
         for i in 0..10 {
             let query_vec = query_vectors[(i * dims) as usize..(i * dims + dims) as usize].to_vec();
             let mut query_eid: ann::EId = [0u8; 16];
@@ -203,6 +310,17 @@ mod test {
                     nodes_gnd_truth.insert(*nn_eid);
                 });
             let intersection_count = nodes_gnd_truth.intersection(&nodes_found).count();
+            let percentage = (intersection_count as f32 / (k as f32)) * 100.0;
+
+
+            // Print values before assertion
+            println!(
+                "For vid: {} | found: {}/{} | Percentage: {}%",
+                i,
+                intersection_count,
+                k,
+                percentage
+            );
             assert!(
                 (intersection_count as f32 / (k as f32)) * 100.0 >= 90.0f32,
                 "for vid: {} | found: {}/{} ",
@@ -210,10 +328,13 @@ mod test {
                 intersection_count,
                 k
             );
+            recall = intersection_count as f32 / (k as f32);
         }
+        println!("Recall: {}", recall);
     }
 
     #[test]
+    // takes 1.45 minutes to run
     fn sift_small_ann() {
         // let directory = Path::new("../../../../eval/data/siftsmall/");
         let directory = Path::new("../../data/siftsmall/");
@@ -222,10 +343,10 @@ mod test {
             directory: directory,
             dims: dims,
         };
-        let k: usize = 10;
+        let k: usize = 100;
 
         let base_vectors = loader
-            .fetch_vectors("sift_base.fvecs", 128)
+            .fetch_vectors("siftsmall_base.fvecs", 128)
             .expect("unable to fetch the base vectors");
         let mut eids: Vec<base::ann::EId> = vec![[0u8; 16]; base_vectors.len() / 128];
         for i in 0..base_vectors.len() / 128 {
@@ -238,11 +359,11 @@ mod test {
             eids[i] = eid;
         }
         let query_vectors = loader
-            .fetch_vectors("sift_query.fvecs", 128)
+            .fetch_vectors("siftsmall_query.fvecs", 128)
             .expect("unable to fetch the query vectors");
 
         let truth_vectors = loader
-            .fetch_ground_truth_by_id("sift_groundtruth.ivecs", k, 100)
+            .fetch_ground_truth_by_id("siftsmall_groundtruth.ivecs", k, 100)
             .expect("fetching the items");
         let params = ann::ANNParams::DiskANN {
             params: diskannv1::DiskANNParams {
@@ -303,6 +424,19 @@ mod test {
             });
 
             let intersection_count = nodes_gnd_truth.intersection(&nodes_found).count();
+            let recall = (intersection_count as f32 / k as f32) * 100.0; // Convert to percentage
+            let percentage = (intersection_count as f32 / (k as f32)) * 100.0;
+
+
+            // Print values before assertion
+            println!(
+                "For vid: {} | found: {}/{} | Percentage: {}%",
+                i,
+                intersection_count,
+                k,
+                percentage
+            );
+
             total_intersection_count += intersection_count;
             assert!(
                 (intersection_count as f32 / (k as f32)) * 100.0 >= 90.0f32,
@@ -312,9 +446,222 @@ mod test {
                 k
             );
         }
+        let total_percentage = (total_intersection_count as f32 / (k * truth_vectors.len()) as f32) * 100.0;
+        println!(
+            "Total intersection count: {} | Total possible intersections: {} | Total Percentage: {}%",
+            total_intersection_count,
+            k * truth_vectors.len(),
+            total_percentage
+        );
         assert!(
             (total_intersection_count as f32 / (k * truth_vectors.len()) as f32) > 0.95f32,
             "unexpectedly lowered true neighbours found"
         );
+
+
+    }
+
+    #[test]
+    fn gist_inserts() {
+        let directory = Path::new("../../data/gist/");
+        let dims: usize = 960;  // Adjusted for GIST
+        let loader = GIST {    // Struct name adjusted
+            directory: directory,
+            dims: dims,
+        };
+        const FIRST_N_TO_DELETE: usize = 4;
+        let k: usize = 100;
+        println!("Loading base vectors");
+        let base_vectors = loader
+            .fetch_vectors("gist_base.fvecs", 960)
+            .expect("unable to fetch base vectors from disk");
+        let mut eids: Vec<base::ann::EId> = vec![[0u8; 16]; base_vectors.len() / 960];
+        for i in 0..base_vectors.len() / 960 {
+            let mut eid: base::ann::EId = [0u8; 16];
+            BigEndian::write_uint(
+                &mut eid,
+                i.try_into().unwrap(),
+                std::mem::size_of::<usize>(),
+            );
+            eids[i] = eid;
+        }
+        let query_vectors = loader
+            .fetch_vectors("gist_query.fvecs", 960)
+            .expect("unable to fetch the query vectors");
+
+        let truth_vectors = loader
+            .fetch_ground_truth_by_id("gist_groundtruth.ivecs", k + FIRST_N_TO_DELETE, 100)
+            .expect("fetching the items");
+
+        let params = ann::ANNParams::DiskANN {
+            params: diskannv1::DiskANNParams {
+                dim: 960,
+                max_points: eids.len(),
+                indexing_threads: None,
+                indexing_range: 64,       // R
+                indexing_queue_size: 100, // L
+                indexing_maxc: 120,       // C
+                indexing_alpha: 1.4,      // alpha
+                maintenance_period_millis: 100,
+            },
+        };
+        println!("Creating index");
+        let ann_idx: Arc<diskannv1::DiskANNV1Index<metric::MetricL2, f32>> =
+            Arc::new(ann::ANNIndex::new(&params).expect("error creating diskannv1 index"));
+        let maintain_arc = ann_idx.clone();
+        let _t = std::thread::spawn(move || {
+            maintain_arc.maintain();
+        });
+        println!("Inserting vectors");
+        let start = Instant::now();
+        assert!(
+            ann_idx
+                .insert(
+                    &eids,
+                    base::ann::Points::Values {
+                        vals: &base_vectors
+                    }
+                )
+                .is_ok(),
+            "unexpected err on batch_insert to the vector store"
+        );
+        println!("Inserting vectors took: {:?}", start.elapsed());
+        println!("Starting search");
+    }
+
+    #[test]
+    fn gist_ann() {
+        let directory = Path::new("../../data/gist/");
+        let dims: usize = 960;
+        let loader = GIST {
+            directory: directory,
+            dims: dims,
+        };
+        let k: usize = 10;
+
+        println!("Loading base vectors");
+        let base_vectors = loader
+            .fetch_vectors("gist_base.fvecs", 960)
+            .expect("unable to fetch the base vectors");
+        let mut eids: Vec<base::ann::EId> = vec![[0u8; 16]; base_vectors.len() / 960];
+        for i in 0..base_vectors.len() / 960 {
+            let mut eid: base::ann::EId = [0u8; 16];
+            BigEndian::write_uint(
+                &mut eid,
+                i.try_into().unwrap(),
+                std::mem::size_of::<usize>(),
+            );
+            eids[i] = eid;
+        }
+        let query_vectors = loader
+            .fetch_vectors("gist_query.fvecs", 960)
+            .expect("unable to fetch the query vectors");
+
+
+        let truth_vectors = loader
+            .fetch_ground_truth_by_id("gist_groundtruth.ivecs", k, 100)
+            .expect("fetching the items");
+        let params = ann::ANNParams::DiskANN {
+            params: diskannv1::DiskANNParams {
+                dim: 960,
+                max_points: eids.len(),
+                indexing_threads: None,
+                indexing_range: 64,       // R
+                indexing_queue_size: 100, // L
+                indexing_maxc: 140,       // C
+                indexing_alpha: 1.2,      // alpha
+                maintenance_period_millis: 100,
+            },
+        };
+        println!("Creating index");
+        let ann_idx: Arc<diskannv1::DiskANNV1Index<metric::MetricL2, f32>> =
+            Arc::new(ann::ANNIndex::new(&params).expect("error creating diskannv1 index"));
+        let _t_ann_idx = ann_idx.clone();
+        let _t = std::thread::spawn(move || {
+            _t_ann_idx.maintain();
+        });
+        println!("Inserting vectors");
+        assert!(
+            ann_idx
+                .insert(
+                    &eids,
+                    ann::Points::Values {
+                        vals: &base_vectors
+                    }
+                )
+                .is_ok(),
+            "unexpected err on batch_insert to the vector store"
+        );
+        println!("Vectors inserted successfully!");
+
+        let mut total_intersection_count: usize = 0;
+        for i in 0..truth_vectors.len() {
+            let query_vec = query_vectors[(i * dims) as usize..(i * dims + dims) as usize].to_vec();
+            let mut query_eid: ann::EId = [0u8; 16];
+            BigEndian::write_uint(
+                &mut query_eid,
+                i.try_into().unwrap(),
+                std::mem::size_of::<usize>(),
+            );
+            let nns = ann_idx
+                .search(ann::Points::Values { vals: &query_vec }, k)
+                .expect("unexpected error fetching the closest vectors");
+            let mut nodes_found: HashSet<ann::EId> = HashSet::new();
+            for nn in nns.iter() {
+                let mut eid: base::ann::EId = [0u8; 16];
+                BigEndian::write_uint(
+                    &mut eid,
+                    nn.vid.try_into().unwrap(),
+                    std::mem::size_of::<usize>(),
+                );
+                nodes_found.insert(eid);
+            }
+            let mut nodes_gnd_truth: HashSet<ann::EId> = HashSet::new();
+            let closest_ids = truth_vectors.get(&(query_eid)).unwrap();
+            closest_ids[0..k].iter().for_each(|nn_eid| {
+                nodes_gnd_truth.insert(*nn_eid);
+            });
+
+            let intersection_count = nodes_gnd_truth.intersection(&nodes_found).count();
+            let recall = (intersection_count as f32 / k as f32) * 100.0; // Convert to percentage
+            let percentage = (intersection_count as f32 / (k as f32)) * 100.0;
+            //println!("Recall for vid {}: {}%", i, recall);
+            //println!("Query vector for vid {}: {:?}", i, &query_vec[..5]); // prints first 5 elements
+            //println!("ANN results for vid {}: {:?}", i, nodes_found);
+            //println!("Ground truth for vid {}: {:?}", i, nodes_gnd_truth);
+
+
+            // Print values before assertion
+            println!(
+                "For vid: {} | found: {}/{} | Percentage: {}%",
+                i,
+                intersection_count,
+                k,
+                percentage
+            );
+
+            total_intersection_count += intersection_count;
+            assert!(
+                (intersection_count as f32 / (k as f32)) * 100.0 >= 0.1f32,
+                "for vid: {} | found: {}/{} ",
+                i,
+                intersection_count,
+                k
+            );
+        }
+
+
+        let total_percentage = (total_intersection_count as f32 / (k * truth_vectors.len()) as f32) * 100.0;
+        println!(
+            "Total intersection count: {} | Total possible intersections: {} | Total Percentage: {}%",
+            total_intersection_count,
+            k * truth_vectors.len(),
+            total_percentage
+        );
+        assert!(
+            (total_intersection_count as f32 / (k * truth_vectors.len()) as f32) > 0.05f32,
+            "unexpectedly lowered true neighbours found"
+        );
     }
 }
+
